@@ -1,0 +1,10 @@
+*.txt
+*.zip
+*.jsonl
+*.tsv
+**__pycache__/
+.DS_Store
+
+*.pt
+*.pyc
+!requirements.txt
