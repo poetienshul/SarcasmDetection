@@ -1,4 +1,4 @@
-# SarcasmDetection
+# SarcasmDetection - CS 7650 NLP Final Project Repo
 ## Directory Structure
 - utils
     - dataloader.py (data parser to use torchtext for models)
