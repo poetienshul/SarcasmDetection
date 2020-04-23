@@ -41,6 +41,31 @@ def evaluate(model, iterator):
             epoch_acc += acc.item()
     return epoch_loss / len(iterator), epoch_acc / len(iterator)
 
+def confusion(model, iterator, label_dict, tokenizer):
+    predictions = []
+    gt = []
+    sents = []
+    model.eval()
+    TP, FP, FN, TN = 0, 0, 0, 0
+    with torch.no_grad():
+        for batch in iterator:
+            loss, logits = model(batch.sequence, labels=batch.label.squeeze(1))
+
+            preds = torch.argmax(logits, axis=1)
+            for p in preds:
+                predictions.append(p.item())
+            for p in batch.label.squeeze(1):
+                gt.append(p.item())
+            for s in batch.sequence:
+                sents.append(' '.join(tokenizer.convert_ids_to_tokens(s, skip_special_tokens=True)))
+
+            TP += ((preds == label_dict['SARCASM']) & (batch.label.squeeze(1) == label_dict['SARCASM'])).sum()
+            FP += ((preds == label_dict['SARCASM']) & (batch.label.squeeze(1) == label_dict['NOT_SARCASM'])).sum()
+            FN += ((preds == label_dict['NOT_SARCASM']) & (batch.label.squeeze(1) == label_dict['SARCASM'])).sum()
+            TN += ((preds == label_dict['NOT_SARCASM']) & (batch.label.squeeze(1) == label_dict['NOT_SARCASM'])).sum()
+
+    return TP, FP, FN, TN, sents, predictions, gt
+
 def test(model, iterator):
     predictions = []
     model.eval()
@@ -62,6 +87,15 @@ def create_submission(predictions, source, label_dict):
         for i, p in enumerate(predictions):
             fh.write('{}_{}, {}\n'.format(source, i+1, classes[p]))
     print ("Predictions written to {}_answer.txt".format(source))
+
+def error_analysis(sents, predictions, gt, source, label_dict):
+    # classes = {1: 'SARCASM', 0: 'NOT_SARCASM'}
+    classes = {v: k for k, v in label_dict.items()}
+    print (classes)
+    with open(source + '_analysis.txt', 'w') as fh:
+        for i, p in enumerate(predictions):
+            fh.write('{}, {}, {}\n'.format(sents[i], classes[p], classes[gt[i]]))
+    print ("Predictions written to {}_analysis.txt".format(source))
 
 def main(params):
     # Load pretrained specified model
@@ -88,6 +122,14 @@ def main(params):
         model.load_state_dict(torch.load(params['pretrained_model']))
         predictions = test(model, test_iterator)
         create_submission(predictions, params['data_source'], label_dict)
+        sys.exit()
+
+    if params['confusion']:
+        print ('Loading model from {}'.format(params['pretrained_model']))
+        model.load_state_dict(torch.load(params['pretrained_model']))
+        TP, FP, FN, TN, sents, predictions, gt = confusion(model, valid_iterator, label_dict, d.tokenizer)
+        error_analysis(sents, predictions, gt, params['data_source'], label_dict)
+        print ('TP: {}, FP: {}, FN: {}, TN: {}'.format(TP, FP, FN, TN))
         sys.exit()
 
     best_valid_loss = float('inf')
@@ -120,6 +162,7 @@ def parse_args():
     parser.add_argument('--data_dir', default='bert_data')
     parser.add_argument('--save_model', default='simple_bert.pt')
     parser.add_argument('--predict', default=False, type=bool)
+    parser.add_argument('--confusion', default=False, type=bool)
     parser.add_argument('--pretrained_model', default='simple_bert.pt')
     args = parser.parse_args()
     params = vars(args)

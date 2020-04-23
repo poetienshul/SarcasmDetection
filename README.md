@@ -24,3 +24,6 @@ Then train and generate predictions using one of the following models:
 Generating predictions will generate a file like *twitter_answer.txt*, convert to .zip by:  
 
     ./create_submission.sh
+
+
+Performing error analysis can be done with the "--confusion True" flag, printing out the confusion matrix and writing to a *twitter_analysis.txt* file, containing a file of "sequence, predicted tag, ground truth tag"
