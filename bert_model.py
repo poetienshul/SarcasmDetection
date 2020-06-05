@@ -1,6 +1,6 @@
 import random
 import numpy as np
-from transformers import BertTokenizer, BertModel, BertForTokenClassification
+from transformers import BertForSequenceClassification, RobertaForSequenceClassification, XLNetForSequenceClassification, AdamW
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,215 +8,173 @@ import torch.optim as optim
 from tqdm import tqdm
 from utils import dataloader
 
+import argparse
+
 import time
 import sys
-# torch.set_printoptions(threshold=500000)
-SEED = 135
 
-# random.seed(SEED)
-# np.random.seed(SEED)
-# torch.manual_seed(SEED)
-# torch.backends.cudnn.deterministic = True
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
-class BERTSarcasm(nn.Module):
-    def __init__(self, bert, hidden_dim, output_dim, n_layers, bidirectional, dropout):
-        super().__init__()
-        
-        self.bert = bert
-        embedding_dim = bert.config.to_dict()['hidden_size']
-        
-        self.rnn = nn.GRU(embedding_dim,
-                          hidden_dim,
-                          num_layers = n_layers,
-                          bidirectional = bidirectional,
-                          batch_first = True,
-                          dropout = 0 if n_layers < 2 else dropout)
-        
-        self.out = nn.Linear(hidden_dim * 2 if bidirectional else hidden_dim, output_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, text):
-        # print (text)
-        # print (torch.max(text))
-        # print (torch.min(text))
-        # print (text.shape)
-        with torch.no_grad():
-            embedded = self.bert(text)[0]
-
-
-        # print ('embedded: {}'.format(embedded))
-        # print ('embedded shape: {}'.format(embedded.shape))
-        #embedded = [batch size, sent len, emb dim]
-        _, hidden = self.rnn(embedded)
-
-        #hidden = [n layers * n directions, batch size, emb dim]
-        
-        if self.rnn.bidirectional:
-            hidden = self.dropout(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim = 1))
-        else:
-            hidden = self.dropout(hidden[-1,:,:])
-
-                
-        #hidden = [batch size, hid dim]
-        
-        output = self.out(hidden)
-
-        # scores = F.log_softmax(output, dim=1)
-        
-        #output = [batch size, out dim]
-        
-        return output
-
-
-def binary_accuracy(preds, y):
-    """
-    Returns accuracy per batch, i.e. if you get 8/10 right, this returns 0.8, NOT 8
-    """
-    #round predictions to the closest integer
-    rounded_preds = torch.round(torch.sigmoid(preds))
-    # rounded_preds = torch.argmax(preds, axis=1)
-    correct = (rounded_preds == y).float() #convert into float for division 
-    acc = correct.sum() / len(correct)
-    return acc
-
-# def f1_score(preds, y):
-#     #round predictions to the closest integer
-#     # rounded_preds = torch.round(torch.sigmoid(preds))
-#     rounded_preds = torch.argmax(preds, axis=1)
-#     correct = (rounded_preds == y).float() #convert into float for division 
-#     acc = correct.sum() / len(correct)
-#     return acc
-
-def train(model, iterator, optimizer, criterion):
-    epoch_loss = 0
-    epoch_acc = 0
-
+def train(epoch, model, train_iterator, optimizer, verbose=False):
     model.train()
-
-    # for batch in tqdm(iterator):
-    for batch in iterator:
+    for i, batch in enumerate(train_iterator):
         optimizer.zero_grad()
-        # print ('batch: {}'.format(batch.sequence))
-        predictions = model(batch.sequence)#.squeeze(1)
-        # print ('predicionts shape: {}'.format(predictions.shape))
-        # print ('ground truth shape: {}'.format(batch.label.squeeze(1).shape))
-        # print (predictions)
-        # print (F.one_hot(batch.label.squeeze(1)))
-        # print ('predictions: '.format(predictions))
-        # print (predictions)
-        # print (batch.label)
-        loss = criterion(predictions, batch.label.float())#.squeeze(1))
-        # print ('batch train loss: {}'.format(loss))
-        acc = binary_accuracy(predictions, batch.label.float())#.squeeze(1))
-        # print ('batch train acc: {}'.format(acc))
+        loss, logits = model(batch.sequence, labels=batch.label.squeeze(1))
         loss.backward()
         optimizer.step()
-        
-        epoch_loss += loss.item()
-        epoch_acc += acc.item()
-        
-    return epoch_loss / len(iterator), epoch_acc / len(iterator)
+        if verbose:
+            print ("batch {} / {}: train loss: {}".format(i, num_batches, loss))
 
-def evaluate(model, iterator, criterion):
-    
-    epoch_loss = 0
-    epoch_acc = 0
-    
+def evaluate(model, iterator):
     model.eval()
-    
     with torch.no_grad():
+        epoch_loss = 0
+        epoch_acc = 0
         for batch in iterator:
-            predictions = model(batch.sequence)#.squeeze(1)
-            
-            # loss = criterion(predictions, batch.label.float())
-            loss = criterion(predictions, batch.label.float())#.squeeze(1))
-            # print ('batch train loss: {}'.format(loss))
-            acc = binary_accuracy(predictions, batch.label.float())#.squeeze(1))
+            loss, logits = model(batch.sequence, labels=batch.label.squeeze(1))
+
+            preds = torch.argmax(logits, axis=1)
+            correct = (preds == batch.label.squeeze(1)).float()
+            acc = correct.sum() / len(correct)
 
             epoch_loss += loss.item()
             epoch_acc += acc.item()
-        
     return epoch_loss / len(iterator), epoch_acc / len(iterator)
 
-def epoch_time(start_time, end_time):
-    elapsed_time = end_time - start_time
-    elapsed_mins = int(elapsed_time / 60)
-    elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
-    return elapsed_mins, elapsed_secs
+def confusion(model, iterator, label_dict, tokenizer):
+    predictions = []
+    gt = []
+    sents = []
+    model.eval()
+    TP, FP, FN, TN = 0, 0, 0, 0
+    with torch.no_grad():
+        for batch in iterator:
+            loss, logits = model(batch.sequence, labels=batch.label.squeeze(1))
 
+            preds = torch.argmax(logits, axis=1)
+            for p in preds:
+                predictions.append(p.item())
+            for p in batch.label.squeeze(1):
+                gt.append(p.item())
+            for s in batch.sequence:
+                sents.append(' '.join(tokenizer.convert_ids_to_tokens(s, skip_special_tokens=True)))
 
-# def predict_sentiment(model, tokenizer, sentence):
-#     model.eval()
-#     tokens = tokenizer.tokenize(sentence)
-#     print (tokens)
-#     tokens = tokens[:max_input_length-2]
-#     indexed = [init_token_idx] + tokenizer.convert_tokens_to_ids(tokens) + [eos_token_idx]
-#     tensor = torch.LongTensor(indexed).to(device)
-#     tensor = tensor.unsqueeze(0)
-#     prediction = torch.sigmoid(model(tensor))
-#     return prediction.item()
+            TP += ((preds == label_dict['SARCASM']) & (batch.label.squeeze(1) == label_dict['SARCASM'])).sum()
+            FP += ((preds == label_dict['SARCASM']) & (batch.label.squeeze(1) == label_dict['NOT_SARCASM'])).sum()
+            FN += ((preds == label_dict['NOT_SARCASM']) & (batch.label.squeeze(1) == label_dict['SARCASM'])).sum()
+            TN += ((preds == label_dict['NOT_SARCASM']) & (batch.label.squeeze(1) == label_dict['NOT_SARCASM'])).sum()
 
+    return TP, FP, FN, TN, sents, predictions, gt
 
-if __name__ == '__main__':
-    # bert = BertForTokenClassification.from_pretrained('bert-base-uncased')
-    bert = BertModel.from_pretrained('bert-base-uncased')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def test(model, iterator):
+    predictions = []
+    model.eval()
+    with torch.no_grad():
+        epoch_loss = 0
+        epoch_acc = 0
+        for batch in iterator:
+            logits = model(batch.sequence)
+            preds = torch.argmax(logits[0], axis=1)
+            for p in preds:
+                predictions.append(p.item())
+    return predictions
 
-    BATCH_SIZE = 128
-    HIDDEN_DIM = 256
-    OUTPUT_DIM = 1
-    N_LAYERS = 2
-    BIDIRECTIONAL = True
-    DROPOUT = 0.25
-    LEARNING_RATE = 5e-6
-    MOMENTUM = 0.90
+def create_submission(predictions, source, label_dict):
+    # classes = {1: 'SARCASM', 0: 'NOT_SARCASM'}
+    classes = {v: k for k, v in label_dict.items()}
+    print (classes)
+    with open(source + '_answer.txt', 'w') as fh:
+        for i, p in enumerate(predictions):
+            fh.write('{}_{}, {}\n'.format(source, i+1, classes[p]))
+    print ("Predictions written to {}_answer.txt".format(source))
 
-    model = BERTSarcasm(bert, HIDDEN_DIM, OUTPUT_DIM, N_LAYERS, BIDIRECTIONAL, DROPOUT)
+def error_analysis(sents, predictions, gt, source, label_dict):
+    # classes = {1: 'SARCASM', 0: 'NOT_SARCASM'}
+    classes = {v: k for k, v in label_dict.items()}
+    print (classes)
+    with open(source + '_analysis.txt', 'w') as fh:
+        for i, p in enumerate(predictions):
+            fh.write('{}, {}, {}\n'.format(sents[i], classes[p], classes[gt[i]]))
+    print ("Predictions written to {}_analysis.txt".format(source))
 
-    # optimizer = optim.Adam(model.parameters())
-    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=1e-1)
-    criterion = nn.BCEWithLogitsLoss()
-    # criterion = nn.CrossEntropyLoss()
-
+def main(params):
+    # Load pretrained specified model
+    if params['model'] == 'bert':
+        model = BertForSequenceClassification.from_pretrained('bert-base-uncased')
+    elif params['model'] == 'roberta':
+        model = RobertaForSequenceClassification.from_pretrained('roberta-base')
+    elif params['model'] == 'xlnet':
+        model = XLNetForSequenceClassification.from_pretrained('xlnet-base-cased')
     model = model.to(device)
-    criterion = criterion.to(device)
 
-    N_EPOCHS = 400
+    # optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=1e-1)
+    # optimizer = optim.RMSprop(model.parameters(), lr=LEARNING_RATE)
+    optimizer = AdamW(model.parameters(), lr=params['lr'], correct_bias=False, weight_decay=params['weight_decay'])
+
+    d = dataloader.Dataloader(params)
+    train_iterator, valid_iterator, test_iterator, label_dict = d.fetch_data()
+    print ("# of train batches: {}".format(len(train_iterator)))
+    print ("# of valid batches: {}".format(len(valid_iterator)))
+    print ("# of test batches: {}".format(len(test_iterator)))
+
+    if params['predict']:
+        print ('Loading model from {}'.format(params['pretrained_model']))
+        model.load_state_dict(torch.load(params['pretrained_model']))
+        predictions = test(model, test_iterator)
+        create_submission(predictions, params['data_source'], label_dict)
+        sys.exit()
+
+    if params['confusion']:
+        print ('Loading model from {}'.format(params['pretrained_model']))
+        model.load_state_dict(torch.load(params['pretrained_model']))
+        TP, FP, FN, TN, sents, predictions, gt = confusion(model, valid_iterator, label_dict, d.tokenizer)
+        error_analysis(sents, predictions, gt, params['data_source'], label_dict)
+        print ('TP: {}, FP: {}, FN: {}, TN: {}'.format(TP, FP, FN, TN))
+        sys.exit()
 
     best_valid_loss = float('inf')
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    special_tokens_dict = {'eos_token': '[EOS]'}
-    num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
-    print (len(tokenizer))
-    model.bert.resize_token_embeddings(len(tokenizer))
-    
-    train_iterator, valid_iterator, test_iterator, label_dict = dataloader.fetch_data('reddit', BATCH_SIZE=BATCH_SIZE, SEED=SEED)
-    print (len(train_iterator))
-    print (len(valid_iterator))
+    num_batches = len(train_iterator)
 
-    for epoch in range(N_EPOCHS):
+    for epoch in range(params['epochs']):
+        train(epoch, model, train_iterator, optimizer, verbose=False)
 
-        start_time = time.time()
+        train_loss, train_acc = evaluate(model, train_iterator)
+        # print ("epoch {}: train loss: {0:.3f}, acc: {0:.3f}".format(epoch, train_loss, train_acc))
+
+        valid_loss, valid_acc = evaluate(model, valid_iterator)
+        print ("Epoch {0}: train loss: {1:.3f}, acc: {2:.3f}; valid loss: {3:.3f}, acc: {4:.3f}".format(epoch, train_loss, train_acc, valid_loss, valid_acc))
         
-        train_loss, train_acc = train(model, train_iterator, optimizer, criterion)
-        valid_loss, valid_acc = evaluate(model, valid_iterator, criterion)
-            
-        end_time = time.time()
-            
-        epoch_mins, epoch_secs = epoch_time(start_time, end_time)
-            
         if valid_loss < best_valid_loss:
+            print ("Better valid loss found: {}, saving model to {}".format(valid_loss, params['save_model']))
             best_valid_loss = valid_loss
-            torch.save(model.state_dict(), 'tut6-model.pt')
-        
-        print(f'Epoch: {epoch+1:02} | Epoch Time: {epoch_mins}m {epoch_secs}s')
-        print(f'\tTrain Loss: {train_loss:.3f} | Train Acc: {train_acc*100:.2f}%')
-        print(f'\t Val. Loss: {valid_loss:.3f} |  Val. Acc: {valid_acc*100:.2f}%')
-    # model.load_state_dict(torch.load('tut6-model.pt'))
+            torch.save(model.state_dict(), params['save_model'])
+        # torch.save(model.state_dict(), 'e_' + str(epoch) + params['save_model'])
 
-    # test_loss, test_acc = evaluate(model, test_iterator, criterion)
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--lr', default=1e-6, type=float)
+    parser.add_argument('--weight_decay', default=0, type=float)
+    parser.add_argument('--seed', default=11171, type=int)
+    parser.add_argument('--epochs', default=30, type=int)
+    parser.add_argument('--batch_size', default=8, type=int)
+    parser.add_argument('--model', default='bert', choices=['bert', 'roberta', 'xlnet'])
+    parser.add_argument('--data_source', default='twitter')
+    parser.add_argument('--data_dir', default='bert_data')
+    parser.add_argument('--save_model', default='simple_bert.pt')
+    parser.add_argument('--predict', default=False, type=bool)
+    parser.add_argument('--confusion', default=False, type=bool)
+    parser.add_argument('--pretrained_model', default='simple_bert.pt')
+    args = parser.parse_args()
+    params = vars(args)
+    return params
 
-    # print(f'Test Loss: {test_loss:.3f} | Test Acc: {test_acc*100:.2f}%')
+if __name__ == '__main__':
+    params = parse_args()
+    main(params)
+# roberta
+# CUDA_VISIBLE_DEVICES=1 python simple_bert.py --model roberta --data_dir roberta_data --save_model simple_roberta.pt
+# CUDA_VISIBLE_DEVICES=0 python simple_bert.py --model roberta --data_dir roberta_data --predict True --pretrained_model simple_roberta.pt
 
-    # predict_sentiment(model, tokenizer, "This film is terrible")
+# xlnet
+# CUDA_VISIBLE_DEVICES=1 python simple_bert.py --model xlnet --data_dir xlnet_data --save_model simple_xlnet.pt
+# CUDA_VISIBLE_DEVICES=0 python simple_bert.py --model xlnet --data_dir xlnet_data --predict True --pretrained_model simple_xlnet.pt
