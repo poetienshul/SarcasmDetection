@@ -42,6 +42,6 @@ tqdm==4.43.0
 transformers==2.4.1
 twilio==6.37.0
 twython==3.7.0
-urllib3==1.25.8
+urllib3==1.26.5
 yagmail==0.11.224
 zipp==3.1.0
